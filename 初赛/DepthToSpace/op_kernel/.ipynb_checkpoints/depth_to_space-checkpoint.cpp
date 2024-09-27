@@ -1,0 +1,395 @@
+#include "kernel_operator.h"
+using namespace AscendC;
+/* 这里实现4个kernel对应四种情况，将过多的if-else分配到外面来，更好的符合SIMD*/
+
+/*
+分析：
+对于一个depthtospace算子，reshape阶段不需要计算，只需要完成transpose过程中数据的搬运。
+对与dims[0,1,2,3,4,5]这几个维度来说，transpose前后变化的维度用b表示，维度保持不变的用a表示
+则四种情况为为
+[a, b, b, b, b, b]
+[a, a, b, b, b, b]
+[a, a, b, b, a, a]
+[a, a, b, b, b, b]
+可以将其分为三个部分，前，中，后，
+前面部分不变，则可以讲前面这些维度的划分到不同的AICORE上进行计算
+中间变的部分就是需要遍历计算的部分
+后面不变的部分，对应到内存中的数据一直保持连续，所以可以连续搬运(注意数据对齐，可以用DataCopyPad保证)
+*/
+
+constexpr int BUFFER_NUM = 2;
+/* 1. mode = DCR, data_format = NCHW  00 */ 
+class Kernel00{
+
+public:
+     __aicore__ inline Kernel00(){}
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, 
+                                 uint32_t N, uint32_t C,uint32_t H,uint32_t W, uint32_t block_size, uint32_t alignedTile
+                                 ){
+         this->N = N;
+         this->C = C;
+         this->H = H;
+         this->W = W;
+         this->block_size = block_size;
+         uint32_t core_size = C * H * W;
+         auto startPointer = core_size * GetBlockIdx();
+         this->block_length = core_size;
+         this->alignedTile = alignedTile;
+         pipe.InitBuffer(inQueueX, BUFFER_NUM, alignedTile * sizeof(DTYPE_X));
+         GM_X.SetGlobalBuffer((__gm__ DTYPE_X*)x + startPointer, core_size);
+         GM_Y.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startPointer, core_size);
+            
+         /* b, block_size, block_size, c//(block_size**2), h, w */
+         tmp = C / (block_size * block_size);
+         os5 = 1;
+         os4 = W;
+         os3 = H * os4;
+         os2 = tmp * os3;
+         os1 = block_size * os2;
+         /* transpose [0, 3, 4, 1, 5, 2] */
+         ns5 = 1;
+         ns4 = block_size;
+         ns3 = W * ns4;
+         ns2 = block_size * ns3;
+         ns1 = H * ns2;
+     }
+     __aicore__ inline void Process() {
+         for(uint32_t i = 0;i < block_size; i ++){
+             for(uint32_t j = 0;j < block_size; j ++){
+                 for(uint32_t k = 0;k < tmp; k ++){
+                     for(uint32_t h = 0;h < H; h ++){
+                         // CopyIn(i, j, k, h);
+                         // CopyOut(i, j, k, h);
+                         // for(uint32_t t = 0;t < W; t ++){
+                         //     auto input_index = i * os1 + j * os2 + k * os3 + h * os4 + t * os5;
+                         //     auto output_index = k * ns1 + h * ns2 + i * ns3 + t * ns4 + j * ns5;
+                         //     // GM_Y.SetValue(output_index, (DTYPE_Y)(input_index));
+                         //     GM_Y.SetValue(output_index, (DTYPE_Y)GM_X.GetValue(input_index));
+                         // }
+                         for(uint32_t t = 0;t < W; t ++){
+                             CopyIn(i, j, k, h, t);
+                             CopyOut(i, j, k, h, t);
+                         }
+                     }
+                 }
+             }
+         }
+     }
+    __aicore__ inline void CopyIn(uint32_t i, uint32_t j, uint32_t k, uint32_t h, uint32_t t){
+        LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPadExtParams<DTYPE_Y> padParams{true, 0, 0, 0};
+        DataCopyPad(xLocal, GM_X[i * os1 + j * os2 + k * os3 + h * os4 + t * os5], copyParams, padParams);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void CopyOut(uint32_t i, uint32_t j, uint32_t k, uint32_t h, uint32_t t){
+        LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPad(GM_Y[k * ns1 + h * ns2 + i * ns3 + t * ns4 + j * ns5], xLocal, copyParams);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+private:
+    TPipe pipe;
+    GlobalTensor<DTYPE_X> GM_X, GM_Y;
+    uint32_t N, C, H, W, block_size, block_length;
+    uint32_t os0, os1, os2, os3, os4, os5, tmp;
+    uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    TQueBind<TPosition::VECIN, TPosition::VECOUT, BUFFER_NUM>inQueueX;
+    uint32_t alignedTile;
+    // uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    
+};
+/* 2. mode = CDR, data_format = NCHW  10 */
+class Kernel10{
+public:
+     __aicore__ inline Kernel10(){}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, 
+                                 uint32_t N, uint32_t C,uint32_t H,uint32_t W, uint32_t block_size, uint32_t alignedTile
+                                 ){
+         this->N = N;
+         this->C = C;
+         this->H = H;
+         this->W = W;
+         this->block_size = block_size;
+         uint32_t core_size = block_size * block_size * H * W;
+         auto startPointer = core_size * GetBlockIdx();
+         this->block_length = core_size;
+         this->alignedTile = alignedTile;
+         pipe.InitBuffer(inQueueX, BUFFER_NUM, alignedTile * sizeof(DTYPE_X));
+         GM_X.SetGlobalBuffer((__gm__ DTYPE_X*)x + startPointer, core_size);
+         GM_Y.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startPointer, core_size);
+            
+         /* b, c//(block_size**2), block_size, block_size, h, w */
+         tmp = C / (block_size * block_size);
+         os5 = 1;
+         os4 = W;
+         os3 = H * os4;
+         os2 = block_size * os3;
+         os1 = block_size * os2;
+         /* transpose [0, 1, 4, 2, 5, 3] */
+         ns5 = 1;
+         ns4 = block_size;
+         ns3 = W * ns4;
+         ns2 = block_size * ns3;
+         ns1 = H * ns2;
+     }
+     __aicore__ inline void Process() {
+         // for(uint32_t i = 0;i < tmp; i ++){
+             for(uint32_t j = 0;j < block_size; j ++){
+                 for(uint32_t k = 0;k < block_size; k ++){
+                     for(uint32_t h = 0;h < H; h ++){
+                         // CopyIn(i, j, k, h);
+                         // CopyOut(i, j, k, h);
+                         // for(uint32_t t = 0;t < W; t ++){
+                         //     auto input_index = j * os2 + k * os3 + h * os4 + t * os5;
+                         //     auto output_index = h * ns2 + j * ns3 + t * ns4 + k * ns5;
+                         //     // GM_Y.SetValue(output_index, (DTYPE_Y)(input_index));
+                         //     GM_Y.SetValue(output_index, (DTYPE_Y)GM_X.GetValue(input_index));
+                         // }
+                         for(uint32_t t = 0;t < W; t ++){
+                             CopyIn(j, k, h, t);
+                             CopyOut(j, k, h, t);
+                         }
+                     }
+                 }
+             }
+         // }
+     }
+    __aicore__ inline void CopyIn(uint32_t j, uint32_t k, uint32_t h, uint32_t t){ //uint32_t i, 
+        LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPadExtParams<DTYPE_Y> padParams{true, 0, 0, 0};
+        DataCopyPad(xLocal, GM_X[j * os2 + k * os3 + h * os4 + t * os5], copyParams, padParams);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void CopyOut(uint32_t j, uint32_t k, uint32_t h, uint32_t t){ // uint32_t i, 
+        LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        // for(uint32_t t = 0;t < W; t ++){
+        //     auto now = xLocal.GetValue(t);
+        //     /*先用 SetValue 实现，后面改成DataCopy*/
+        //     auto out_index = j * os4 + k * os2 + h * os5 + t * os3;
+        //     GM_Y.SetValue(out_index, now);
+        // }
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPad(GM_Y[h * ns2 + j * ns3 + t * ns4 + k * ns5], xLocal, copyParams);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+private:
+    TPipe pipe;
+    GlobalTensor<DTYPE_X> GM_X, GM_Y;
+    uint32_t N, C, H, W, block_size, block_length;
+    uint32_t os0, os1, os2, os3, os4, os5, tmp;
+    uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    TQueBind<TPosition::VECIN, TPosition::VECOUT, BUFFER_NUM>inQueueX;
+    uint32_t alignedTile;
+    // uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    
+};
+/* 3. mode = DCR, data_format = NHWC  01 */
+class Kernel01{
+public:
+     __aicore__ inline Kernel01(){}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, 
+                                 uint32_t N, uint32_t C,uint32_t H,uint32_t W, uint32_t block_size, uint32_t alignedTile, uint32_t dataType
+                                 ){
+         this->N = N;
+         this->C = C;
+         this->H = H;
+         this->W = W;
+         this->block_size = block_size;
+         uint32_t core_size = C * W;
+         auto startPointer = core_size * GetBlockIdx();
+         this->block_length = core_size;
+         this->alignedTile = alignedTile;
+         this->dataType = dataType;
+         /* b, h, w, block_size, block_size, c//(block_size**2) */
+         tmp = C / (block_size * block_size);
+         os5 = 1;
+         os4 = tmp;
+         os3 = block_size * os4;
+         os2 = block_size * os3;
+         os1 = W * os2;
+         /* transpose [0, 1, 3, 2, 4, 5] */
+         ns5 = 1;
+         ns4 = tmp;
+         ns3 = block_size * ns4;
+         ns2 = W * ns3;
+         ns1 = block_size * ns2;
+         this->real_copy_size = static_cast<uint32_t>(this->block_size * this->tmp * sizeof(DTYPE_X));
+         pipe.InitBuffer(inQueueX, BUFFER_NUM, alignedTile * sizeof(DTYPE_X));
+         // pipe.InitBuffer(inQueueX, BUFFER_NUM, this->block_size * this->tmp * sizeof(DTYPE_X));
+         GM_X.SetGlobalBuffer((__gm__ DTYPE_X*)x + startPointer, core_size);
+         GM_Y.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startPointer, core_size);
+            
+        
+     }
+     __aicore__ inline void Process() {
+         // for(uint32_t i = 0;i < H; i ++){
+             for(uint32_t j = 0;j < W; j ++){
+                 for(uint32_t k = 0;k < block_size; k ++){
+                     
+                     CopyIn(j, k);
+                     CopyOut(j, k);
+                 }
+             }
+         // }
+     }
+    
+    __aicore__ inline void CopyIn(uint32_t j, uint32_t k){ //uint32_t i, , uint32_t h
+        LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        if(dataType == 1){
+            DataCopyExtParams copyParams{1, real_copy_size , 0, 0, 0};
+            DataCopyPadExtParams<DTYPE_Y> padParams{true, 0, 0, 0};
+            DataCopyPad(xLocal, GM_X[j * os2 + k * os3], copyParams, padParams);
+        }
+        else{
+            DataCopy(xLocal, GM_X[j * os2 + k * os3], alignedTile);
+        }
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void CopyOut(uint32_t j, uint32_t k){ // uint32_t i, , uint32_t h,
+        LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        if(dataType == 1){
+            DataCopyExtParams copyParams{1, real_copy_size, 0, 0, 0};
+            DataCopyPad(GM_Y[k * ns2 + j * ns3], xLocal, copyParams);
+        }
+        else{
+            DataCopy(GM_Y[k * ns2 + j * ns3], xLocal, alignedTile);
+        }
+        inQueueX.FreeTensor(xLocal);
+    }
+
+private:
+    TPipe pipe;
+    GlobalTensor<DTYPE_X> GM_X, GM_Y;
+    uint32_t N, C, H, W, block_size, block_length;
+    uint32_t os0, os1, os2, os3, os4, os5, tmp;
+    uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    TQueBind<TPosition::VECIN, TPosition::VECOUT, BUFFER_NUM>inQueueX;
+    uint32_t alignedTile, real_copy_size;
+    uint32_t offset_x = 0;
+    uint32_t offset_y = 0;
+    uint32_t dataType;
+    // uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    
+};
+/* 4. mode = CDR, data_format = NHWC  11 */
+class Kernel11{
+public:
+     __aicore__ inline Kernel11(){}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, 
+                                 uint32_t N, uint32_t C,uint32_t H,uint32_t W, uint32_t block_size, uint32_t alignedTile
+                                 ){
+         this->N = N;
+         this->C = C;
+         this->H = H;
+         this->W = W;
+         this->block_size = block_size;
+         uint32_t core_size = C * W;
+         this->alignedTile = alignedTile;
+         auto startPointer = core_size * GetBlockIdx();
+         this->block_length = core_size;
+         pipe.InitBuffer(inQueueX, BUFFER_NUM, alignedTile * sizeof(DTYPE_X));
+         GM_X.SetGlobalBuffer((__gm__ DTYPE_X*)x + startPointer, core_size);
+         GM_Y.SetGlobalBuffer((__gm__ DTYPE_Y*)y + startPointer, core_size);
+            
+         /* b, h, w, c//(block_size**2), block_size, block_size */
+         tmp = C / (block_size * block_size);
+         os5 = 1;
+         os4 = block_size;
+         os3 = block_size * os4;
+         os2 = tmp * os3;
+         os1 = W * os2;
+         /* transpose [0, 1, 4, 2, 5, 3] */
+         ns5 = 1;
+         ns4 = tmp;
+         ns3 = block_size * ns4;
+         ns2 = W * ns3;
+         ns1 = block_size * ns2;
+     }
+     __aicore__ inline void Process() {
+         // for(uint32_t i = 0;i < H; i ++){
+             for(uint32_t j = 0;j < W; j ++){
+                 for(uint32_t k = 0;k < tmp; k ++){
+                     for(uint32_t h = 0;h < block_size; h ++){
+                         // CopyIn(i, j, k, h);
+                         // CopyOut(i, j, k, h);
+                         // for(uint32_t t = 0;t < block_size; t ++){
+                         //     auto input_index = i * os1 + j * os2 + k * os3 + h * os4 + t * os5;
+                         //     auto output_index = i * ns1 + h * ns2 + j * ns3 + t * ns4 + k * ns5;
+                         //     // GM_Y.SetValue(output_index, (DTYPE_Y)(input_index));
+                         //     GM_Y.SetValue(output_index, (DTYPE_Y)GM_X.GetValue(input_index));
+                         // }
+                         for(uint32_t t = 0;t < block_size; t ++){
+                             CopyIn(j, k, h, t);
+                             CopyOut(j, k, h, t);
+                         }
+                     }
+                 }
+             }
+         // }
+     }
+    __aicore__ inline void CopyIn(uint32_t j, uint32_t k, uint32_t h, uint32_t t){ // uint32_t i, 
+        LocalTensor<DTYPE_X> xLocal = inQueueX.AllocTensor<DTYPE_X>();
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPadExtParams<DTYPE_Y> padParams{true, 0, 0, 0};
+        DataCopyPad(xLocal, GM_X[j * os2 + k * os3 + h * os4 + t * os5], copyParams, padParams);
+        inQueueX.EnQue(xLocal);
+    }
+    __aicore__ inline void CopyOut(uint32_t j, uint32_t k, uint32_t h, uint32_t t){ // uint32_t i, 
+        LocalTensor<DTYPE_X> xLocal = inQueueX.DeQue<DTYPE_X>();
+        // for(uint32_t t = 0;t < block_size; t ++){
+        //     auto now = xLocal.GetValue(t);
+        //     /*先用 SetValue 实现，后面改成DataCopy*/
+        //     auto out_index = i * os1 + j * os4 + k * os2 + h * os5 + t * os3;
+        //     GM_Y.SetValue(out_index, now);
+        // }
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(1 * sizeof(DTYPE_X)), 0, 0, 0};
+        DataCopyPad(GM_Y[h * ns2 + j * ns3 + t * ns4 + k * ns5], xLocal, copyParams);
+        inQueueX.FreeTensor(xLocal);
+    }
+
+private:
+    TPipe pipe;
+    GlobalTensor<DTYPE_X> GM_X, GM_Y;
+    uint32_t N, C, H, W, block_size, block_length;
+    uint32_t os0, os1, os2, os3, os4, os5, tmp;
+    uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    TQueBind<TPosition::VECIN, TPosition::VECOUT, BUFFER_NUM>inQueueX;
+    uint32_t alignedTile;
+    // uint32_t ns0, ns1, ns2, ns3, ns4, ns5;
+    
+};
+
+extern "C" __global__ __aicore__ void depth_to_space(GM_ADDR x, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tiling_data, tiling);
+    // TODO: user kernel impl
+    // printf("N = %d, C = %d, H = %d, W = %d , block_size = %d , alignedTile = %d \n ",tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.blockSize, tiling_data.alignedTile);
+    if(tiling_data.mode == 0 && tiling_data.dataFormat == 0){
+        // printf("************* \n Kernel00\n ************* \n ");
+        Kernel00 op;
+        op.Init(x, y, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.blockSize, tiling_data.alignedTile);
+        op.Process();
+    }
+    if(tiling_data.mode == 1 && tiling_data.dataFormat == 0){
+        // printf("************* \n Kernel10\n ************* \n ");
+        Kernel10 op;
+        op.Init(x, y, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.blockSize, tiling_data.alignedTile);
+        op.Process();
+    }
+    if(tiling_data.mode == 0 && tiling_data.dataFormat == 1){
+        // printf("************* \n Kernel01\n ************* \n ");
+        Kernel01 op;
+        op.Init(x, y, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.blockSize, tiling_data.alignedTile, tiling_data.dataType);
+        op.Process();
+    }
+    if(tiling_data.mode == 1 && tiling_data.dataFormat == 1){
+        // printf("************* \n Kernel11\n ************* \n ");
+        Kernel11 op;
+        op.Init(x, y, tiling_data.N, tiling_data.C, tiling_data.H, tiling_data.W, tiling_data.blockSize, tiling_data.alignedTile);
+        op.Process();
+    }
+    
+}
